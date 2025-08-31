@@ -1,5 +1,7 @@
 # Projeto de Gaze-Tracking
 
+---
+
 ## 🛠️ Instalação
 
 1. **Clone o repositório**
@@ -18,3 +20,20 @@ pip install -r requirements.txt
 ```bash
 python src/main.py
 ```
+
+---
+
+## 🎮 Modo de usar
+
+1. Pressione `c` para iniciar a **calibração** na tela de visualização da câmera
+2. Olhe para cada ponto vermelho e pressione `SPACE`
+3. Após calibração, o sistema **predirá** onde você está olhando
+4. Use `r` para resetar calibração e recalibrar se necessário
+
+**Controles adicionais**
+- `l`: alternar landmarks
+- `i`: alternar detecção de íris
+- `q`: sair
+
+---
+*Baseado no artigo: 'Efficiency in Real-time Webcam Gaze Tracking*
