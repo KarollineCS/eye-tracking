@@ -1,7 +1,5 @@
 # Projeto de Gaze-Tracking
 
----
-
 ## 🛠️ Instalação
 
 1. **Clone o repositório**
