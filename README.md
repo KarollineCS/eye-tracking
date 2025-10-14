@@ -34,4 +34,7 @@ python src/main.py
 - `q`: sair
 
 ---
-*Baseado no artigo: 'Efficiency in Real-time Webcam Gaze Tracking*
+
+## 🔗 Referências
+
+- Gudi, A., Li, X., van Gemert, J. (2020). Efficiency in Real-Time Webcam Gaze Tracking. In: Bartoli, A., Fusiello, A. (eds) Computer Vision – ECCV 2020 Workshops. ECCV 2020. Lecture Notes in Computer Science(), vol 12535. Springer, Cham. https://doi.org/10.1007/978-3-030-66415-2_34
