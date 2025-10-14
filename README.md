@@ -1,5 +1,7 @@
 # Projeto de Gaze-Tracking
 
+**Este projeto possui um propósito exclusivamente acadêmico, sendo desenvolvido como Trabalho de Conclusão de Curso.**
+
 ## 🛠️ Instalação
 
 1. **Clone o repositório**
