@@ -11,14 +11,14 @@ except ImportError:
     MEDIAPIPE_AVAILABLE = False
 
 class IrisTracker:
-    """Rastreador de íris com múltiplas estratégias"""
+    """Rastreador de íris otimizado com múltiplas estratégias"""
     
     def __init__(self, config):
         self.config = config
         self.iris_history = {'left': deque(maxlen=5), 'right': deque(maxlen=5)}
         self.max_iris_movement = config.algorithm.max_iris_movement
         self.last_iris_positions = {'left': None, 'right': None}
-        
+
         # Índices dos landmarks da íris no MediaPipe
         self.LEFT_IRIS_LANDMARKS = [474, 475, 476, 477]
         self.RIGHT_IRIS_LANDMARKS = [469, 470, 471, 472]
@@ -39,6 +39,11 @@ class IrisTracker:
         else:
             self.face_mesh = None
             print("⚠️ MediaPipe não disponível. Funcionalidade limitada.")
+
+        self.improved_detection = None
+        if hasattr(config, 'algorithm') and hasattr(config.algorithm, 'use_mediapipe') and config.algorithm.use_mediapipe:
+            self.improved_detection = ImprovedIrisDetection(config)
+            print("✓ MediaPipe iris detection habilitado")
     
     def detect_iris_mediapipe(self, frame) -> Dict:
         """Detecta íris usando MediaPipe"""
@@ -48,6 +53,8 @@ class IrisTracker:
         try:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb_frame)
+
+            self.face_mesh_results = results
             
             if results.multi_face_landmarks:
                 face_landmarks = results.multi_face_landmarks[0]
@@ -359,6 +366,12 @@ class IrisTracker:
         #Método principal para rastreamento de íris
         method = self.config.algorithm.iris_detection_method
         
+        if self.improved_detection is not None:
+            iris_data = self.improved_detection.detect_iris_mediapipe(frame)
+            if iris_data:
+                return iris_data
+        
+        # === FALLBACK: SEU CÓDIGO ORIGINAL ===
         if method == "direct":
             return self.detect_iris_direct(frame, face_landmarks)
         elif method == "improved":
@@ -373,3 +386,135 @@ class IrisTracker:
         else:
             # Default para detecção direta
             return self.detect_iris_direct(frame, face_landmarks)
+
+class ImprovedIrisDetection:
+    """
+    Adiciona detecção de íris via MediaPipe ao IrisTracker existente
+    USO: Chame isso DENTRO do seu track_iris() atual
+    """
+    
+    def __init__(self, config=None):
+        self.config = config
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,  # CRÍTICO para íris
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        # Índices dos landmarks da íris no MediaPipe
+        self.LEFT_IRIS_CENTER_IDX = 468
+        self.RIGHT_IRIS_CENTER_IDX = 473
+        self.LEFT_EYE = [33, 133, 160, 159, 158, 157, 173, 246]
+        self.RIGHT_EYE = [362, 263, 387, 386, 385, 384, 398, 466]
+    
+    def detect_iris_mediapipe(self, frame):
+        """
+        Detecta íris usando MediaPipe
+        Retorna dados da íris E do centro do olho.
+        """
+        h, w = frame.shape[:2]
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(frame_rgb)
+
+        self.face_mesh_results = results # Salva para o main.py usar
+
+        if not results or not results.multi_face_landmarks:
+            return {}
+
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        iris_data = {}
+
+        try:
+            # --- Processar olho esquerdo ---
+            lm_left_iris = face_landmarks[self.LEFT_IRIS_CENTER_IDX]
+            left_iris_3d = np.array([lm_left_iris.x * w, lm_left_iris.y * h, lm_left_iris.z * w])
+
+            # NOVO: Calcular centro do OLHO esquerdo usando APENAS os cantos
+            # Índice 33 = canto externo, 133 = canto interno
+            left_corner_outer = np.array([face_landmarks[33].x * w, face_landmarks[33].y * h])
+            left_corner_inner = np.array([face_landmarks[133].x * w, face_landmarks[133].y * h])
+            left_eye_center_2d = (left_corner_outer + left_corner_inner) / 2.0
+
+            # Calcular largura do olho para normalização
+            left_eye_width = np.linalg.norm(left_corner_outer - left_corner_inner)
+            # FIM DO NOVO
+
+            # DEBUG
+            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
+                print(f"DEBUG IrisTracker [left]: iris_center={left_iris_3d[:2]}, eye_center={left_eye_center_2d}")
+                print(f"DEBUG IrisTracker [left]: largura do olho={left_eye_width:.2f} px")
+                diff = left_iris_3d[:2] - left_eye_center_2d
+                print(f"DEBUG IrisTracker [left]: diferença (dx, dy) = ({diff[0]:.2f}, {diff[1]:.2f})")
+
+            iris_data['left'] = {
+                'center': (int(left_iris_3d[0]), int(left_iris_3d[1])),
+                'center_3d': left_iris_3d,
+                'eye_center_2d': left_eye_center_2d,
+                'eye_width': left_eye_width,  # Largura do olho para normalização
+                'radius': self._estimate_radius(face_landmarks, self.LEFT_IRIS_CENTER_IDX, self.LEFT_EYE, w, h)
+            }
+        except Exception as e_left:
+            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
+                print(f"Debug Iris: Falha ao processar olho esquerdo: {e_left}")
+
+        try:
+            # --- Processar olho direito ---
+            lm_right_iris = face_landmarks[self.RIGHT_IRIS_CENTER_IDX]
+            right_iris_3d = np.array([lm_right_iris.x * w, lm_right_iris.y * h, lm_right_iris.z * w])
+
+            # NOVO: Calcular centro do OLHO direito usando APENAS os cantos
+            # Índice 362 = canto externo, 263 = canto interno
+            right_corner_outer = np.array([face_landmarks[362].x * w, face_landmarks[362].y * h])
+            right_corner_inner = np.array([face_landmarks[263].x * w, face_landmarks[263].y * h])
+            right_eye_center_2d = (right_corner_outer + right_corner_inner) / 2.0
+
+            # Calcular largura do olho para normalização
+            right_eye_width = np.linalg.norm(right_corner_outer - right_corner_inner)
+            # FIM DO NOVO
+
+            # DEBUG
+            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
+                print(f"DEBUG IrisTracker [right]: iris_center={right_iris_3d[:2]}, eye_center={right_eye_center_2d}")
+                print(f"DEBUG IrisTracker [right]: largura do olho={right_eye_width:.2f} px")
+                diff = right_iris_3d[:2] - right_eye_center_2d
+                print(f"DEBUG IrisTracker [right]: diferença (dx, dy) = ({diff[0]:.2f}, {diff[1]:.2f})")
+
+            iris_data['right'] = {
+                'center': (int(right_iris_3d[0]), int(right_iris_3d[1])),
+                'center_3d': right_iris_3d,
+                'eye_center_2d': right_eye_center_2d,
+                'eye_width': right_eye_width,  # Largura do olho para normalização
+                'radius': self._estimate_radius(face_landmarks, self.RIGHT_IRIS_CENTER_IDX, self.RIGHT_EYE, w, h)
+            }
+        except Exception as e_right:
+            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
+                print(f"Debug Iris: Falha ao processar olho direito: {e_right}")
+
+        return iris_data
+    
+    def _estimate_radius(self, landmarks, center_idx, eye_indices, w, h):
+        """Estima o raio do olho (distância do centro ao canto)"""
+        try:
+            center_lm = landmarks[center_idx]
+            center = np.array([center_lm.x * w, center_lm.y * h])
+
+            # Calcula a média da distância do centro da pupila
+            # aos cantos do olho (landmarks 33 e 133 para esquerdo, 362 e 263 para direito)
+            if center_idx == self.LEFT_IRIS_CENTER_IDX:
+                corner_indices = [33, 133] # Canto esquerdo e direito do olho esquerdo
+            else:
+                corner_indices = [362, 263] # Canto esquerdo e direito do olho direito
+
+            distances = []
+            for idx in corner_indices:
+                lm = landmarks[idx]
+                corner = np.array([lm.x * w, lm.y * h])
+                distances.append(np.linalg.norm(corner - center))
+
+            # Raio estimado como 25% da distância média
+            return int(np.mean(distances) * 0.25)
+        except:
+            return 15 # Fallback
