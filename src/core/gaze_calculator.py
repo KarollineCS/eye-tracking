@@ -21,7 +21,7 @@ class HybridGazeEstimator:
         print(f"🖥️ Usando dispositivo: {self.device}")
         
         self.face_size = 96
-        self.eye_width = 96   
+        self.eye_width = 96  
         self.eye_height = 64
         
         self.model = self._load_pretrained_model()
@@ -48,6 +48,8 @@ class HybridGazeEstimator:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                                std=[0.229, 0.224, 0.225])
         ])
+
+        self.eye_sphere_system = EyeSphereSystem()
     
     def _load_pretrained_model(self):
         """Carrega o modelo pré-treinado"""
@@ -244,16 +246,17 @@ class GazeCalculator:
         """Calcula gaze usando ML ou método geométrico"""
         
         # Tentar ML primeiro
-        if self.use_ml and frame is not None and face_bbox is not None:
-            ml_result = self.ml_estimator.estimate_gaze(frame, face_bbox, landmarks)
+        #if self.use_ml and frame is not None and face_bbox is not None:
+        #    ml_result = self.ml_estimator.estimate_gaze(frame, face_bbox, landmarks)
             
-            if ml_result is not None:
-                # Converter para formato padrão
-                gaze_vectors = self._ml_to_gaze_vectors(ml_result, iris_data)
-                return self._apply_smoothing(gaze_vectors)
-        
+        #    if ml_result is not None:
+        #        # Converter para formato padrão
+        #        gaze_vectors = self._ml_to_gaze_vectors(ml_result, iris_data)
+        #        return self._apply_smoothing(gaze_vectors)
+
         # Fallback para método geométrico
-        return self.calculate_gaze_geometric(iris_data, landmarks)
+        frame_width = frame.shape[1] if frame is not None else 600
+        return self.calculate_gaze_geometric(iris_data, landmarks, frame_width)
     
     def _ml_to_gaze_vectors(self, ml_result, iris_data):
         """Converte resultado ML para formato de gaze_vectors"""
@@ -288,7 +291,7 @@ class GazeCalculator:
             }
         }
     
-    def calculate_gaze_geometric(self, iris_data, landmarks):
+    def calculate_gaze_geometric(self, iris_data, landmarks, frame_width=600):
         """Método geométrico como fallback"""
         if not iris_data:
             return {}
@@ -296,39 +299,79 @@ class GazeCalculator:
         gaze_vectors = {}
         
         for eye_side in ['left', 'right']:
-            if eye_side not in iris_data:
+            # Verifica se temos todos os dados necessários do iris_tracker
+            if (eye_side not in iris_data or 
+                'center' not in iris_data[eye_side] or 
+                'eye_center_2d' not in iris_data[eye_side]):
                 continue
             
-            iris_info = iris_data[eye_side]
-            iris_center = iris_info['center']
+            # Pega os dados do MediaPipe
+            iris_center = iris_data[eye_side]['center']
+            eye_center = iris_data[eye_side]['eye_center_2d']
             
-            # Estimar centro do olho
-            if landmarks is not None and len(landmarks) >= 48:
-                if eye_side == 'left':
-                    eye_points = landmarks[36:42]
-                else:
-                    eye_points = landmarks[42:48]
-                eye_center = np.mean(eye_points, axis=0)
-            else:
-                eye_center = iris_center
+            # --- LÓGICA ANTIGA (REMOVIDA) ---
+            # Não precisamos mais verificar 'landmarks' (dlib)
+            # if landmarks is not None and len(landmarks) >= 48:
+            #     ...
+            # else:
+            #     eye_center = iris_center # <-- O BUG ESTAVA AQUI
+            # --- FIM DA LÓGICA ANTIGA ---
             
             # Calcular direção
             dx = iris_center[0] - eye_center[0]
             dy = iris_center[1] - eye_center[1]
-            
-            # Converter para ângulos
-            focal_length = 600
+
+            # DEBUG: Mostrar valores brutos
+            if self.config.debug_enabled:
+                print(f"DEBUG Gaze [{eye_side}]: iris={iris_center}, eye_center={eye_center}")
+                print(f"DEBUG Gaze [{eye_side}]: dx={dx:.2f}, dy={dy:.2f}")
+
+            # MÉTODO MELHORADO: Normalizar pela largura do olho
+            # Isso converte deslocamento em pixels para uma razão relativa (0.0-1.0 aproximadamente)
+            if 'eye_width' in iris_data[eye_side] and iris_data[eye_side]['eye_width'] > 0:
+                eye_width = iris_data[eye_side]['eye_width']
+                # Normalizar: dividir pelo raio (metade da largura)
+                dx_normalized = dx / (eye_width / 2.0)
+                dy_normalized = dy / (eye_width / 2.0)
+
+                if self.config.debug_enabled:
+                    print(f"DEBUG Gaze [{eye_side}]: largura_olho={eye_width:.2f}, dx_norm={dx_normalized:.3f}, dy_norm={dy_normalized:.3f}")
+
+                # Usar valores normalizados
+                dx = dx_normalized
+                dy = dy_normalized
+            else:
+                # Fallback: normalizar por raio se configurado
+                if self.config.algorithm.normalize_by_radius:
+                    if 'radius' in iris_data[eye_side] and iris_data[eye_side]['radius'] > 0:
+                        dx /= (iris_data[eye_side]['radius'] * 2)
+                        dy /= (iris_data[eye_side]['radius'] * 2)
+
+            # Converter para ângulos usando focal_length AJUSTADA
+            # Como dx/dy agora são valores normalizados (~-1 a +1), usamos focal menor
+            focal_length = 1.0  # Focal length para valores normalizados
             yaw = np.arctan(dx / focal_length)
-            pitch = np.arctan(dy / focal_length)
+            pitch = np.arctan(dy / focal_length) * -1.0  # Inverte o eixo Y
+
+            if self.config.debug_enabled:
+                print(f"DEBUG Gaze [{eye_side}]: ANTES ganho: yaw={yaw:.4f}, pitch={pitch:.4f}")
+
+            # Aplicar ganho de amplificação
+            gain = self.config.algorithm.gaze_gain
+            yaw *= gain
+            pitch *= gain
+
+            if self.config.debug_enabled:
+                print(f"DEBUG Gaze [{eye_side}]: APÓS ganho: yaw={yaw:.4f}, pitch={pitch:.4f}")
             
-            # Vetor 3D
+            # Vetor 3D (para compatibilidade)
             vector_3d = np.array([dx, dy, focal_length])
             vector_3d = vector_3d / np.linalg.norm(vector_3d)
             
             gaze_vectors[eye_side] = {
                 'yaw': float(yaw),
                 'pitch': float(pitch),
-                'eye_center': eye_center.tolist() if isinstance(eye_center, np.ndarray) else list(eye_center),
+                'eye_center': list(eye_center),
                 'iris_center': list(iris_center),
                 'vector_3d': vector_3d.tolist()
             }
@@ -392,3 +435,119 @@ class GazeCalculator:
             return {'yaw': gaze_vectors['right']['yaw'], 'pitch': gaze_vectors['right']['pitch']}
         
         return None
+    
+    def calculate_gaze_3d(self, iris_data, head_center, R_head, current_scale):
+        if not self.eye_sphere_system.left_calibrated:
+            return {}
+        
+        # Preparar dados
+        iris_positions_3d = {}
+        if 'left' in iris_data and 'center_3d' in iris_data['left']:
+            iris_positions_3d['left'] = iris_data['left']['center_3d']
+        if 'right' in iris_data and 'center_3d' in iris_data['right']:
+            iris_positions_3d['right'] = iris_data['right']['center_3d']
+        
+        # Obter centros das esferas
+        eye_centers = self.eye_sphere_system.get_eye_centers(
+            head_center, R_head, current_scale
+        )
+        
+        # Calcular gaze 3D
+        return self.eye_sphere_system.compute_gaze_3d(
+            eye_centers, iris_positions_3d
+        )
+
+    def calibrate_eye_spheres(self, iris_data, head_center, R_head, current_scale):
+        if 'left' not in iris_data or 'right' not in iris_data:
+            return False
+        
+        iris_left_3d = iris_data['left']['center_3d']
+        iris_right_3d = iris_data['right']['center_3d']
+        
+        self.eye_sphere_system.calibrate_spheres(
+            iris_left_3d, iris_right_3d,
+            head_center, R_head, current_scale
+        )
+        
+        return True
+    
+class EyeSphereSystem:
+    """
+    Sistema de esferas oculares 3D
+    USO: Chame isso no calculate_gaze() quando tiver pose 3D
+    """
+    
+    def __init__(self):
+        self.base_radius = 12.0  # mm
+        self.left_calibrated = False
+        self.right_calibrated = False
+        self.left_offset = None
+        self.right_offset = None
+        self.left_scale = None
+        self.right_scale = None
+    
+    def calibrate_spheres(self, iris_left_3d, iris_right_3d, 
+                         head_center, R_head, current_scale):
+        """Calibra esferas oculares (chamar UMA VEZ)"""
+        camera_dir = np.array([0, 0, 1], dtype=float)
+        camera_dir_local = R_head.T @ camera_dir
+        camera_dir_local = camera_dir_local / np.linalg.norm(camera_dir_local)
+        
+        # Esquerda
+        iris_left_local = R_head.T @ (iris_left_3d - head_center)
+        self.left_offset = iris_left_local + self.base_radius * camera_dir_local
+        self.left_scale = current_scale
+        self.left_calibrated = True
+        
+        # Direita
+        iris_right_local = R_head.T @ (iris_right_3d - head_center)
+        self.right_offset = iris_right_local + self.base_radius * camera_dir_local
+        self.right_scale = current_scale
+        self.right_calibrated = True
+        
+        print("✓ Esferas oculares calibradas")
+    
+    def get_eye_centers(self, head_center, R_head, current_scale):
+        """Retorna centros das esferas COM compensação de escala"""
+        if not (self.left_calibrated and self.right_calibrated):
+            return {}
+        
+        centers = {}
+        
+        # Esquerda
+        scale_ratio = current_scale / self.left_scale
+        left_offset_scaled = self.left_offset * scale_ratio
+        centers['left'] = head_center + R_head @ left_offset_scaled
+        
+        # Direita
+        scale_ratio = current_scale / self.right_scale
+        right_offset_scaled = self.right_offset * scale_ratio
+        centers['right'] = head_center + R_head @ right_offset_scaled
+        
+        return centers
+    
+    def compute_gaze_3d(self, eye_centers, iris_positions_3d):
+        """Calcula gaze vectors 3D"""
+        gaze_vectors = {}
+        
+        for eye in ['left', 'right']:
+            if eye in eye_centers and eye in iris_positions_3d:
+                eye_center = eye_centers[eye]
+                iris_pos = iris_positions_3d[eye]
+                
+                gaze_vec = iris_pos - eye_center
+                norm = np.linalg.norm(gaze_vec)
+                
+                if norm > 1e-9:
+                    direction = gaze_vec / norm
+                else:
+                    direction = np.array([0, 0, 1])
+                
+                gaze_vectors[eye] = {
+                    'origin': eye_center,
+                    'direction': direction,
+                    'yaw': float(np.arctan2(direction[0], direction[2])),
+                    'pitch': float(np.arcsin(-direction[1]))
+                }
+        
+        return gaze_vectors
