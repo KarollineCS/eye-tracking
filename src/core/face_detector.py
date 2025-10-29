@@ -5,6 +5,7 @@ import urllib.request
 import os
 from collections import deque
 from typing import List, Tuple, Optional
+from scipy.spatial.transform import Rotation as Rscipy
 import time
 
 try:
@@ -14,7 +15,7 @@ except ImportError:
     MEDIAPIPE_AVAILABLE = False
 
 class RobustFaceDetector:
-    """Detector facial com múltiplas estratégias"""
+    """Detector facial robusto com múltiplas estratégias"""
     
     def __init__(self, config):
         self.config = config
@@ -34,6 +35,12 @@ class RobustFaceDetector:
         
         # Inicializar detectores
         self._init_detectors()
+
+        # Inicializar melhorias opcionais
+        self.improved_pose = None
+        if hasattr(config, 'use_pca_pose') and config.use_pca_pose:
+            self.improved_pose = ImprovedHeadPose()
+            print("✓ PCA head pose habilitado")
     
     def _init_detectors(self):
         """Inicializa os detectores faciais"""
@@ -304,3 +311,130 @@ class RobustFaceDetector:
         else:
             # Fallback para DNN
             return self.detect_faces_dnn(frame)
+    
+    def get_head_pose_pca(self, face_landmarks, width, height):
+        if self.improved_pose is None:
+            return None, None, None
+        
+        return self.improved_pose.estimate_pose_pca(face_landmarks, width, height)
+    
+    def get_head_pose_pca(self, face_landmarks, width, height):
+        """Pose usando PCA (mais estável)"""
+        if self.improved_pose is None:
+            return None, None, None
+        
+        head_center, R_head, nose_points = self.improved_pose.estimate_pose_pca(
+            face_landmarks, width, height
+        )
+        self.current_nose_points = nose_points
+        return head_center, R_head, nose_points
+
+    def calibrate_pose_scale(self):
+        """Calibra escala de referência"""
+        if self.improved_pose is None or self.current_nose_points is None:
+            return False
+        self.improved_pose.calibrate_scale(self.current_nose_points)
+        return True
+
+    def get_scale_ratio(self):
+        """Retorna compensação de distância"""
+        if self.improved_pose is None or self.current_nose_points is None:
+            return None
+        return self.improved_pose.get_scale_ratio(self.current_nose_points)
+        
+class ImprovedHeadPose:
+    """
+    Adiciona pose da cabeça via PCA ao FaceDetector existente
+    USO: Chame isso DENTRO dos seus métodos existentes
+    """
+    
+    def __init__(self):
+        # Landmarks do nariz (mais estáveis)
+        self.nose_indices = [
+            4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
+            461, 125, 354, 218, 438, 195, 167, 393, 165, 391,
+            3, 248
+        ]
+        self.R_ref = None
+        self.calibration_scale = None
+    
+    def estimate_pose_pca(self, face_landmarks, w, h):
+        """
+        Estima pose usando PCA (mais estável que PnP)
+        
+        Args:
+            face_landmarks: Landmarks do MediaPipe (468 pontos)
+            w, h: Dimensões do frame
+        
+        Returns:
+            head_center, R_head, nose_points
+        """
+        # Extrair pontos 3D do nariz
+        nose_points_3d = []
+        for idx in self.nose_indices:
+            if idx < len(face_landmarks):
+                lm = face_landmarks[idx]
+                x = lm.x * w
+                y = lm.y * h
+                z = lm.z * w
+                nose_points_3d.append([x, y, z])
+        
+        nose_points_3d = np.array(nose_points_3d, dtype=float)
+        
+        # Centro
+        head_center = np.mean(nose_points_3d, axis=0)
+        
+        # PCA para orientação
+        centered = nose_points_3d - head_center
+        cov = np.cov(centered.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        
+        # Ordenar por magnitude
+        idx_sort = np.argsort(-eigvals)
+        eigvecs = eigvecs[:, idx_sort]
+        
+        # Garantir right-handed
+        if np.linalg.det(eigvecs) < 0:
+            eigvecs[:, 2] *= -1
+        
+        # Converter para Euler e reconstruir
+        r = Rscipy.from_matrix(eigvecs)
+        roll, pitch, yaw = r.as_euler('zyx', degrees=False)
+        R_head = Rscipy.from_euler('zyx', [roll, pitch, yaw]).as_matrix()
+        
+        # Anti-flipping
+        if self.R_ref is None:
+            self.R_ref = R_head.copy()
+        else:
+            for i in range(3):
+                if np.dot(R_head[:, i], self.R_ref[:, i]) < 0:
+                    R_head[:, i] *= -1
+        
+        return head_center, R_head, nose_points_3d
+    
+    def compute_scale(self, nose_points_3d):
+        """Calcula escala atual (distância)"""
+        n = len(nose_points_3d)
+        if n < 2:
+            return 1.0
+        
+        total = 0.0
+        count = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(nose_points_3d[i] - nose_points_3d[j])
+                total += dist
+                count += 1
+        
+        return total / count if count > 0 else 1.0
+    
+    def calibrate_scale(self, nose_points_3d):
+        """Calibra escala de referência"""
+        self.calibration_scale = self.compute_scale(nose_points_3d)
+    
+    def get_scale_ratio(self, nose_points_3d):
+        """Retorna razão de escala (compensação de distância)"""
+        if self.calibration_scale is None:
+            return 1.0
+        current = self.compute_scale(nose_points_3d)
+        return current / self.calibration_scale
