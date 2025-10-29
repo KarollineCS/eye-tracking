@@ -11,10 +11,18 @@ class HardwareConfig:
 @dataclass
 class AlgorithmConfig:
     face_detection_method: str = "dnn"
-    iris_detection_method: str = "improved"
+    iris_detection_method: str = "hybrid"
+    use_mediapipe: bool = True
+    use_pca_pose: bool = True
+    use_eye_spheres: bool = True
     face_detection_interval: int = 3
     max_iris_movement: float = 200.0
     gaze_model_path: str = "models/p00.ckpt"
+
+    # Parâmetros de sensibilidade do gaze
+    gaze_focal_length: float = 400.0  # [DEPRECATED] Não usado mais com nova normalização
+    gaze_gain: float = 1.0  # Fator de amplificação dos ângulos (ajustado para nova normalização)
+    normalize_by_radius: bool = False  # [DEPRECATED] Agora normaliza por largura do olho automaticamente
 
 @dataclass
 class CalibrationConfig:
