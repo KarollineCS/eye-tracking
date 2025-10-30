@@ -37,7 +37,7 @@ class ScreenCalibration:
 
     def is_calibrated(self):
         """Verifica se o sistema está calibrado"""
-        return hasattr(self, 'model') and self.model is not None
+        return self.transformation_matrix is not None and self.calibration_complete
     
     def train_model(self):
         """Treina o modelo de calibração"""
@@ -263,23 +263,46 @@ class ScreenCalibration:
         
         return None
     
+    def _convert_to_python_type(self, value):
+        """Converte valores numpy para tipos Python nativos"""
+        if isinstance(value, (np.integer, np.floating)):
+            return float(value)
+        elif isinstance(value, np.ndarray):
+            return value.tolist()
+        elif isinstance(value, (list, tuple)):
+            return [self._convert_to_python_type(v) for v in value]
+        else:
+            return value
+
     def _save_calibration(self):
         """Salva os dados de calibração em arquivo"""
         calibration_data = {
-            'screen_dimensions': [self.screen_width, self.screen_height],
-            'calibration_points': self.calibration_points,
+            'screen_dimensions': [int(self.screen_width), int(self.screen_height)],
+            'calibration_points': [
+                [self._convert_to_python_type(x) for x in p]
+                for p in self.calibration_points
+            ],
             'collected_data': [
                 {
-                    'screen_point': d['screen_point'],
-                    'gaze_point': d['gaze_point'],
-                    'std': d['std']
+                    'screen_point': [
+                        self._convert_to_python_type(x)
+                        for x in (d['screen_point'] if isinstance(d['screen_point'], (list, tuple)) else [d['screen_point']])
+                    ],
+                    'gaze_point': [
+                        self._convert_to_python_type(x)
+                        for x in (d['gaze_point'] if isinstance(d['gaze_point'], (list, tuple)) else [d['gaze_point']])
+                    ],
+                    'std': [
+                        self._convert_to_python_type(x)
+                        for x in (d['std'] if isinstance(d['std'], (list, tuple)) else [d['std']])
+                    ]
                 } for d in self.collected_data
             ],
             'transformation_matrix': self.transformation_matrix.tolist() if self.transformation_matrix is not None else None,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'monitor_info': {
-                'size_mm': self.monitor_mm,
-                'distance_mm': self.monitor_distance
+                'size_mm': [self._convert_to_python_type(x) for x in (self.monitor_mm if isinstance(self.monitor_mm, (list, tuple)) else [self.monitor_mm])],
+                'distance_mm': self._convert_to_python_type(self.monitor_distance)
             }
         }
 
@@ -287,7 +310,7 @@ class ScreenCalibration:
         os.makedirs('calibration', exist_ok=True)
 
         with open('calibration/screen_calibration.yaml', 'w') as f:
-            yaml.dump(calibration_data, f)
+            yaml.dump(calibration_data, f, default_flow_style=False)
 
         print(f"💾 Calibração salva em 'calibration/screen_calibration.yaml'")
     
@@ -296,16 +319,23 @@ class ScreenCalibration:
         try:
             with open(filepath, 'r') as f:
                 data = yaml.safe_load(f)
-            
+
             self.transformation_matrix = np.array(data['transformation_matrix'])
-            self.calibration_points = data['calibration_points']
-            self.collected_data = data['collected_data']
+            # Converter listas de volta para tuplas
+            self.calibration_points = [tuple(p) for p in data['calibration_points']]
+            self.collected_data = [
+                {
+                    'screen_point': tuple(d['screen_point']) if isinstance(d['screen_point'], list) else d['screen_point'],
+                    'gaze_point': tuple(d['gaze_point']) if isinstance(d['gaze_point'], list) else d['gaze_point'],
+                    'std': tuple(d['std']) if isinstance(d['std'], list) else d['std']
+                } for d in data['collected_data']
+            ]
             self.calibration_complete = True
-            
+
             print(f"✅ Calibração carregada de {filepath}")
             print(f"📅 Data da calibração: {data['timestamp']}")
             return True
-            
+
         except Exception as e:
             print(f"❌ Erro ao carregar calibração: {e}")
             return False
@@ -341,19 +371,29 @@ class ScreenCalibration:
         """Calcula score de qualidade da calibração (0-100)"""
         if not self.collected_data:
             return 0.0
-        
+
         score = 100.0
-        
+
         # Penalizar por alta variância
         stds = [d['std'] for d in self.collected_data]
         avg_std = np.mean([s[0] + s[1] for s in stds])
         score -= min(avg_std * 50, 30)  # Máximo -30 pontos
-        
+
         # Penalizar por poucos pontos
         if len(self.collected_data) < 9:
             score -= (9 - len(self.collected_data)) * 5
-        
+
         return max(0, min(100, score))
+
+    def reset_calibration(self):
+        """Reseta a calibração para o estado inicial"""
+        self.current_point_idx = 0
+        self.collected_data = []
+        self.gaze_samples.clear()
+        self.transformation_matrix = None
+        self.calibration_complete = False
+        self.collection_started = False
+        print("🔄 Calibração resetada")
 
 
 class AdaptiveCalibration:
