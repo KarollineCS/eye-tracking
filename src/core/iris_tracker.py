@@ -38,12 +38,13 @@ class IrisTracker:
             )
         else:
             self.face_mesh = None
-            print("⚠️ MediaPipe não disponível. Funcionalidade limitada.")
+
+        # Resultados do MediaPipe (para compartilhar com outros módulos)
+        self.face_mesh_results = None
 
         self.improved_detection = None
         if hasattr(config, 'algorithm') and hasattr(config.algorithm, 'use_mediapipe') and config.algorithm.use_mediapipe:
             self.improved_detection = ImprovedIrisDetection(config)
-            print("✓ MediaPipe iris detection habilitado")
     
     def detect_iris_mediapipe(self, frame) -> Dict:
         """Detecta íris usando MediaPipe"""
@@ -188,9 +189,6 @@ class IrisTracker:
             # Verificar se mapeamento está trocado
             if (dist_left_to_right_eye < dist_left_to_left_eye and 
                 dist_right_to_left_eye < dist_right_to_right_eye):
-                
-                if self.config.debug_enabled:
-                    print("🔄 Mapeamento trocado detectado - corrigindo")
                 return {
                     'left': iris_data['right'].copy(),
                     'right': iris_data['left'].copy()
@@ -249,14 +247,9 @@ class IrisTracker:
     def detect_iris_with_validation(self, frame, face_landmarks) -> Dict:
         """Detecção de íris com validação e debug"""
         try:
-            if self.config.debug_enabled:
-                print("DEBUG IrisTracker: Iniciando detecção...")
             
             # Usar método original
             iris_data = self.detect_iris_mediapipe(frame)
-            
-            if self.config.debug_enabled:
-                print(f"DEBUG IrisTracker: Dados recebidos: {list(iris_data.keys())}")
             
             # Se não tem dados, retorna histórico
             if not iris_data:
@@ -264,9 +257,6 @@ class IrisTracker:
             
             # Validação baseada nos landmarks faciais
             validated_iris = self._validate_iris_positions(iris_data, face_landmarks)
-            
-            if self.config.debug_enabled:
-                print(f"DEBUG IrisTracker: Após validação: {list(validated_iris.keys())}")
             
             # Se validação rejeitou tudo, usa dados originais
             if not validated_iris and iris_data:
@@ -279,9 +269,7 @@ class IrisTracker:
             smoothed = self._get_smoothed_iris()
             return smoothed
             
-        except Exception as e:
-            if self.config.debug_enabled:
-                print(f"DEBUG IrisTracker: Erro na detecção: {e}")
+        except Exception:
             return self._get_fallback_iris()
     
     def _validate_iris_positions(self, iris_data, face_landmarks) -> Dict:
@@ -311,13 +299,12 @@ class IrisTracker:
         return validated
     
     def _calculate_eye_bbox(self, eye_points) -> Tuple[int, int, int, int]:
-        """Calcula bounding box do olho com margem generosa"""
+        """Calcula bounding box do olho"""
         min_x = min(point[0] for point in eye_points)
         max_x = max(point[0] for point in eye_points)
         min_y = min(point[1] for point in eye_points)
         max_y = max(point[1] for point in eye_points)
         
-        # Margem generosa
         margin_x = (max_x - min_x) * 0.3  # 30% da largura do olho
         margin_y = (max_y - min_y) * 0.5  # 50% da altura do olho
         
@@ -371,7 +358,6 @@ class IrisTracker:
             if iris_data:
                 return iris_data
         
-        # === FALLBACK: SEU CÓDIGO ORIGINAL ===
         if method == "direct":
             return self.detect_iris_direct(frame, face_landmarks)
         elif method == "improved":
@@ -388,18 +374,13 @@ class IrisTracker:
             return self.detect_iris_direct(frame, face_landmarks)
 
 class ImprovedIrisDetection:
-    """
-    Adiciona detecção de íris via MediaPipe ao IrisTracker existente
-    USO: Chame isso DENTRO do seu track_iris() atual
-    """
-    
     def __init__(self, config=None):
         self.config = config
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
-            refine_landmarks=True,  # CRÍTICO para íris
+            refine_landmarks=True, 
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
@@ -409,6 +390,8 @@ class ImprovedIrisDetection:
         self.RIGHT_IRIS_CENTER_IDX = 473
         self.LEFT_EYE = [33, 133, 160, 159, 158, 157, 173, 246]
         self.RIGHT_EYE = [362, 263, 387, 386, 385, 384, 398, 466]
+
+        self.face_mesh_results = None
     
     def detect_iris_mediapipe(self, frame):
         """
@@ -432,7 +415,6 @@ class ImprovedIrisDetection:
             lm_left_iris = face_landmarks[self.LEFT_IRIS_CENTER_IDX]
             left_iris_3d = np.array([lm_left_iris.x * w, lm_left_iris.y * h, lm_left_iris.z * w])
 
-            # NOVO: Calcular centro do OLHO esquerdo usando APENAS os cantos
             # Índice 33 = canto externo, 133 = canto interno
             left_corner_outer = np.array([face_landmarks[33].x * w, face_landmarks[33].y * h])
             left_corner_inner = np.array([face_landmarks[133].x * w, face_landmarks[133].y * h])
@@ -440,14 +422,6 @@ class ImprovedIrisDetection:
 
             # Calcular largura do olho para normalização
             left_eye_width = np.linalg.norm(left_corner_outer - left_corner_inner)
-            # FIM DO NOVO
-
-            # DEBUG
-            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
-                print(f"DEBUG IrisTracker [left]: iris_center={left_iris_3d[:2]}, eye_center={left_eye_center_2d}")
-                print(f"DEBUG IrisTracker [left]: largura do olho={left_eye_width:.2f} px")
-                diff = left_iris_3d[:2] - left_eye_center_2d
-                print(f"DEBUG IrisTracker [left]: diferença (dx, dy) = ({diff[0]:.2f}, {diff[1]:.2f})")
 
             iris_data['left'] = {
                 'center': (int(left_iris_3d[0]), int(left_iris_3d[1])),
@@ -456,16 +430,14 @@ class ImprovedIrisDetection:
                 'eye_width': left_eye_width,  # Largura do olho para normalização
                 'radius': self._estimate_radius(face_landmarks, self.LEFT_IRIS_CENTER_IDX, self.LEFT_EYE, w, h)
             }
-        except Exception as e_left:
-            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
-                print(f"Debug Iris: Falha ao processar olho esquerdo: {e_left}")
+        except Exception:
+            pass
 
         try:
             # --- Processar olho direito ---
             lm_right_iris = face_landmarks[self.RIGHT_IRIS_CENTER_IDX]
             right_iris_3d = np.array([lm_right_iris.x * w, lm_right_iris.y * h, lm_right_iris.z * w])
 
-            # NOVO: Calcular centro do OLHO direito usando APENAS os cantos
             # Índice 362 = canto externo, 263 = canto interno
             right_corner_outer = np.array([face_landmarks[362].x * w, face_landmarks[362].y * h])
             right_corner_inner = np.array([face_landmarks[263].x * w, face_landmarks[263].y * h])
@@ -473,14 +445,6 @@ class ImprovedIrisDetection:
 
             # Calcular largura do olho para normalização
             right_eye_width = np.linalg.norm(right_corner_outer - right_corner_inner)
-            # FIM DO NOVO
-
-            # DEBUG
-            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
-                print(f"DEBUG IrisTracker [right]: iris_center={right_iris_3d[:2]}, eye_center={right_eye_center_2d}")
-                print(f"DEBUG IrisTracker [right]: largura do olho={right_eye_width:.2f} px")
-                diff = right_iris_3d[:2] - right_eye_center_2d
-                print(f"DEBUG IrisTracker [right]: diferença (dx, dy) = ({diff[0]:.2f}, {diff[1]:.2f})")
 
             iris_data['right'] = {
                 'center': (int(right_iris_3d[0]), int(right_iris_3d[1])),
@@ -489,9 +453,8 @@ class ImprovedIrisDetection:
                 'eye_width': right_eye_width,  # Largura do olho para normalização
                 'radius': self._estimate_radius(face_landmarks, self.RIGHT_IRIS_CENTER_IDX, self.RIGHT_EYE, w, h)
             }
-        except Exception as e_right:
-            if self.config and hasattr(self.config, 'debug_enabled') and self.config.debug_enabled:
-                print(f"Debug Iris: Falha ao processar olho direito: {e_right}")
+        except Exception:
+            pass
 
         return iris_data
     
