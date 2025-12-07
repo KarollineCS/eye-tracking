@@ -38,9 +38,14 @@ class RobustFaceDetector:
 
         # Inicializar melhorias opcionais
         self.improved_pose = None
-        if hasattr(config, 'use_pca_pose') and config.use_pca_pose:
+        self.current_nose_points = None  # Para armazenar pontos do nariz
+
+        if hasattr(config, 'algorithm') and hasattr(config.algorithm, 'use_pca_pose') and config.algorithm.use_pca_pose:
             self.improved_pose = ImprovedHeadPose()
-            print("✓ PCA head pose habilitado")
+        else:
+            print("⚠️ PCA head pose NÃO inicializado!")
+            if hasattr(config, 'algorithm'):
+                print(f"   use_pca_pose = {config.algorithm.use_pca_pose if hasattr(config.algorithm, 'use_pca_pose') else 'ATRIBUTO NÃO EXISTE'}")
     
     def _init_detectors(self):
         """Inicializa os detectores faciais"""
@@ -67,9 +72,7 @@ class RobustFaceDetector:
         
         try:
             self.dnn_net = cv2.dnn.readNetFromCaffe(self.prototxt_path, self.model_path)
-            print("✅ Detector DNN carregado com sucesso")
-        except Exception as e:
-            print(f"⚠️ Erro ao carregar detector DNN: {e}")
+        except Exception:
             self.dnn_net = None
     
     def _init_dlib_detector(self):
@@ -82,15 +85,12 @@ class RobustFaceDetector:
             try:
                 os.makedirs("models", exist_ok=True)
                 urllib.request.urlretrieve(self.landmarks_url, self.landmarks_path)
-                print("✅ Modelo de landmarks baixado")
-            except Exception as e:
-                print(f"⚠️ Erro ao baixar landmarks: {e}")
+            except Exception:
+                pass
         
         try:
             self.predictor = dlib.shape_predictor(self.landmarks_path)
-            print("✅ Preditor de landmarks carregado")
-        except Exception as e:
-            print(f"⚠️ Erro ao carregar landmarks: {e}")
+        except Exception:
             self.predictor = None
     
     def _init_mediapipe_detector(self):
@@ -100,7 +100,6 @@ class RobustFaceDetector:
             self.mp_face_detector = self.mp_face_detection.FaceDetection(
                 model_selection=0, min_detection_confidence=0.5
             )
-            print("✅ Detector MediaPipe inicializado")
         else:
             self.mp_face_detector = None
     
@@ -118,9 +117,8 @@ class RobustFaceDetector:
                 print(f"Baixando {filename}...")
                 try:
                     urllib.request.urlretrieve(url, filename)
-                    print(f"✅ {filename} baixado")
-                except Exception as e:
-                    print(f"⚠️ Erro ao baixar {filename}: {e}")
+                except Exception:
+                    pass
     
     def detect_faces_dnn(self, frame) -> Tuple[List, List]:
         """Detecta faces usando DNN OpenCV"""
@@ -361,56 +359,73 @@ class ImprovedHeadPose:
     def estimate_pose_pca(self, face_landmarks, w, h):
         """
         Estima pose usando PCA (mais estável que PnP)
-        
+
         Args:
             face_landmarks: Landmarks do MediaPipe (468 pontos)
             w, h: Dimensões do frame
-        
+
         Returns:
             head_center, R_head, nose_points
         """
-        # Extrair pontos 3D do nariz
-        nose_points_3d = []
-        for idx in self.nose_indices:
-            if idx < len(face_landmarks):
-                lm = face_landmarks[idx]
-                x = lm.x * w
-                y = lm.y * h
-                z = lm.z * w
-                nose_points_3d.append([x, y, z])
-        
-        nose_points_3d = np.array(nose_points_3d, dtype=float)
-        
-        # Centro
-        head_center = np.mean(nose_points_3d, axis=0)
-        
-        # PCA para orientação
-        centered = nose_points_3d - head_center
-        cov = np.cov(centered.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        
-        # Ordenar por magnitude
-        idx_sort = np.argsort(-eigvals)
-        eigvecs = eigvecs[:, idx_sort]
-        
-        # Garantir right-handed
-        if np.linalg.det(eigvecs) < 0:
-            eigvecs[:, 2] *= -1
-        
-        # Converter para Euler e reconstruir
-        r = Rscipy.from_matrix(eigvecs)
-        roll, pitch, yaw = r.as_euler('zyx', degrees=False)
-        R_head = Rscipy.from_euler('zyx', [roll, pitch, yaw]).as_matrix()
-        
-        # Anti-flipping
-        if self.R_ref is None:
-            self.R_ref = R_head.copy()
-        else:
-            for i in range(3):
-                if np.dot(R_head[:, i], self.R_ref[:, i]) < 0:
-                    R_head[:, i] *= -1
-        
-        return head_center, R_head, nose_points_3d
+        try:
+            # Extrair pontos 3D do nariz
+            nose_points_3d = []
+            for idx in self.nose_indices:
+                if idx < len(face_landmarks):
+                    lm = face_landmarks[idx]
+                    x = lm.x * w
+                    y = lm.y * h
+                    z = lm.z * w
+                    nose_points_3d.append([x, y, z])
+
+            if len(nose_points_3d) < 3:
+                return None, None, None
+
+            nose_points_3d = np.array(nose_points_3d, dtype=float)
+
+            # Centro
+            head_center = np.mean(nose_points_3d, axis=0)
+
+            # PCA para orientação
+            centered = nose_points_3d - head_center
+            cov = np.cov(centered.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+
+            # Ordenar por magnitude (maior primeiro)
+            idx_sort = np.argsort(-eigvals)
+            eigvecs = eigvecs[:, idx_sort]
+
+            # IMPORTANTE: Garantir sistema right-handed E orientação correta
+            # MediaPipe: X+=direita, Y+=baixo, Z+=frente
+            # O nariz aponta para frente (Z+)
+
+            # Garantir que o eixo Z (principal) aponta para FRENTE (Z+)
+            # Se o componente Z do primeiro eigenvector for negativo, inverter
+            if eigvecs[2, 0] < 0:  # Se Z do eixo principal é negativo
+                eigvecs[:, 0] *= -1  # Inverter para Z+
+
+            # Garantir right-handed (det > 0)
+            if np.linalg.det(eigvecs) < 0:
+                eigvecs[:, 2] *= -1
+
+            # Usar eigenvectors diretamente como matriz de rotação
+            # Sem conversão Euler para evitar perda de informação
+            R_head = eigvecs.copy()
+
+            # Anti-flipping
+            if self.R_ref is None:
+                self.R_ref = R_head.copy()
+            else:
+                for i in range(3):
+                    if np.dot(R_head[:, i], self.R_ref[:, i]) < 0:
+                        R_head[:, i] *= -1
+
+            return head_center, R_head, nose_points_3d
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return None, None, None
     
     def compute_scale(self, nose_points_3d):
         """Calcula escala atual (distância)"""
