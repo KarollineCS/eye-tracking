@@ -20,9 +20,9 @@ class AlgorithmConfig:
     gaze_model_path: str = "models/p00.ckpt"
 
     # Parâmetros de sensibilidade do gaze
-    gaze_focal_length: float = 400.0  # [DEPRECATED] Não usado mais com nova normalização
-    gaze_gain: float = 1.0  # Fator de amplificação dos ângulos (ajustado para nova normalização)
-    normalize_by_radius: bool = False  # [DEPRECATED] Agora normaliza por largura do olho automaticamente
+    gaze_focal_length: float = 400.0
+    gaze_gain: float = 1.0
+    normalize_by_radius: bool = False
 
 @dataclass
 class CalibrationConfig:
