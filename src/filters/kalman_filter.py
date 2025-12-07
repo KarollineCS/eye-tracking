@@ -8,14 +8,7 @@ class GazeKalmanFilter:
     Reduz ruído e prevê movimento ocular baseado em modelo físico.
     """
     
-    def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.1):
-        """
-        Inicializa o filtro de Kalman para rastreamento de gaze 2D.
-        
-        Args:
-            process_noise: Ruído do processo (movimento natural do olho)
-            measurement_noise: Ruído da medição (erro do sensor)
-        """
+    def __init__(self, process_noise: float = 1e-3, measurement_noise: float = 1e-1):
         # Estado: [x, y, vx, vy] - posição e velocidade
         self.state_dim = 4
         self.measurement_dim = 2
@@ -41,11 +34,6 @@ class GazeKalmanFilter:
         
         dt = 1.0 / 30.0  # Assumindo 30 FPS
         
-        # Matriz de transição de estado (modelo de velocidade constante)
-        # [x_k+1]   [1  0  dt  0] [x_k]
-        # [y_k+1] = [0  1  0  dt] [y_k]
-        # [vx_k+1]  [0  0  1   0] [vx_k]
-        # [vy_k+1]  [0  0  0   1] [vy_k]
         self.kalman.transitionMatrix = np.array([
             [1, 0, dt, 0],
             [0, 1, 0, dt],
@@ -124,6 +112,61 @@ class GazeKalmanFilter:
         self.last_prediction = (filtered_x, filtered_y)
         
         return filtered_x, filtered_y
+    
+    def update_with_confidence(self, measurement: Tuple[float, float], 
+                              external_confidence: float = 1.0) -> Tuple[float, float]:
+        """
+        Atualiza o filtro ajustando o ruído baseado na confiança externa.
+        Use este método quando tiver uma medida de qualidade do tracking.
+        
+        Args:
+            measurement: (x, y) coordenadas medidas
+            external_confidence: 0.0 a 1.0, onde 1.0 é máxima confiança
+            
+        Returns:
+            (x, y) coordenadas filtradas
+        """
+        # Ajustar ruído de medição baseado na confiança
+        # Baixa confiança = mais ruído de medição = filtro confia menos na medição
+        adjusted_noise = self.kalman.measurementNoiseCov.copy()
+        
+        if external_confidence < 0.9:  # Se confiança não é perfeita
+            # Aumentar ruído inversamente à confiança
+            noise_multiplier = 1.0 / max(external_confidence, 0.1)
+            adjusted_noise = adjusted_noise * noise_multiplier
+            
+            # Aplicar temporariamente o ruído ajustado
+            original_noise = self.kalman.measurementNoiseCov.copy()
+            self.kalman.measurementNoiseCov = adjusted_noise
+            
+            # Fazer update normal
+            result = self.update(measurement)
+            
+            # Restaurar ruído original
+            self.kalman.measurementNoiseCov = original_noise
+            
+            return result
+        else:
+            # Alta confiança - usar update normal
+            return self.update(measurement)
+        
+    def apply_offset_correction(self, offset_x: float, offset_y: float):
+        """
+        Aplica correção de offset ao estado atual do filtro.
+        Use após calibração do centro para corrigir deslocamento sistemático.
+        
+        Args:
+            offset_x: Correção em X (pixels)
+            offset_y: Correção em Y (pixels)
+        """
+        if self.initialized:
+            # Ajustar o estado atual
+            self.kalman.statePost[0] -= offset_x
+            self.kalman.statePost[1] -= offset_y
+            
+            # Ajustar também o estado previsto
+            self.kalman.statePre[0] -= offset_x
+            self.kalman.statePre[1] -= offset_y
     
     def predict(self) -> Optional[Tuple[float, float]]:
         """
@@ -245,21 +288,30 @@ class AdaptiveKalmanFilter(GazeKalmanFilter):
         self.base_process_noise = 0.01
         self.base_measurement_noise = 0.1
         
-    def update(self, measurement: Tuple[float, float]) -> Tuple[float, float]:
+    def update(self, measurement: Tuple[float, float], 
+               iris_confidence: float = 1.0) -> Tuple[float, float]:
         """
-        Atualiza com adaptação baseada no tipo de movimento ocular.
+        Atualiza com adaptação baseada no tipo de movimento E qualidade da íris.
+        
+        Args:
+            measurement: (x, y) coordenadas medidas
+            iris_confidence: Confiança da detecção da íris (0.0 a 1.0)
         """
         # Detectar tipo de movimento
         is_saccade = self.saccade_detector.detect(measurement)
         is_fixation = self.fixation_detector.detect(measurement)
         
-        # Ajustar parâmetros baseado no movimento
-        if is_saccade:
-            # Durante sacadas: menos filtragem para capturar movimento rápido
+        # NOVO: Combinar tipo de movimento com confiança da íris
+        if iris_confidence < 0.5:
+            # Baixa confiança na íris - aumentar filtragem
+            process_noise = self.base_process_noise * 0.5
+            measurement_noise = self.base_measurement_noise * 3
+        elif is_saccade:
+            # Durante sacadas COM boa detecção
             process_noise = self.base_process_noise * 10
             measurement_noise = self.base_measurement_noise * 0.5
         elif is_fixation:
-            # Durante fixações: mais filtragem para estabilizar
+            # Durante fixações COM boa detecção
             process_noise = self.base_process_noise * 0.1
             measurement_noise = self.base_measurement_noise * 2
         else:
