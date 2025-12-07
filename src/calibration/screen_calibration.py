@@ -3,252 +3,437 @@ import numpy as np
 import time
 from typing import Tuple, List, Dict, Optional
 import yaml
-import threading
-from collections import deque
 import os
+from collections import deque
+import threading
+import keyboard
 
-class ScreenCalibration:
-    """Sistema de calibração screen-to-gaze com múltiplos pontos"""
+
+class ManualScreenCalibration:
+    """
+    Sistema de calibração manual onde o usuário confirma quando está olhando
+    Baseado no MonitorTracking.py
+    """
     
     def __init__(self, screen_width: int, screen_height: int):
         self.screen_width = screen_width
         self.screen_height = screen_height
         
-        # Pontos de calibração (9 pontos)
+        # Pontos de calibração (9 pontos em grade 3x3)
         self.calibration_points = self._generate_calibration_points()
         self.current_point_idx = 0
         
-        # Dados coletados durante calibração
+        # Dados coletados
         self.collected_data = []
-        self.gaze_samples = deque(maxlen=30)  # Coletar 30 amostras por ponto
+        self.current_samples = []  # Amostras do ponto atual
+        self.is_collecting = False
+        self.collection_thread = None
         
-        # Matriz de transformação
+        # Estado da calibração
         self.transformation_matrix = None
         self.calibration_complete = False
         
-        # Parâmetros de calibração
-        self.point_display_time = 2.0  # segundos por ponto
-        self.point_radius = 20
-        self.collection_started = False
+        # Parâmetros ajustáveis
+        self.min_samples_per_point = 20  # Mínimo de amostras por ponto
+        self.max_samples_per_point = 50  # Máximo de amostras
+        self.point_radius = 25
+        self.collection_rate = 30  # Hz de coleta quando pressionado
         
-        # Monitor virtual para calibração
-        self.monitor_mm = (500, 300)  # Dimensões físicas do monitor em mm
-        self.monitor_distance = 600  # Distância do usuário ao monitor em mm
-
-    def is_calibrated(self):
-        """Verifica se o sistema está calibrado"""
-        return self.transformation_matrix is not None and self.calibration_complete
+        # Feedback visual
+        self.last_gaze_data = None
+        self.space_pressed = False
+        self.enter_pressed = False
+        self.calibration_aborted = False
+        
+        # Estatísticas
+        self.point_start_time = 0
+        self.total_calibration_time = 0
+        self.calibration_start_time = 0
+        
+        # Monitor físico
+        self.monitor_mm = (500, 300)
+        self.monitor_distance = 600
+        
     
-    def train_model(self):
-        """Treina o modelo de calibração"""
-        if len(self.calibration_data) < 5:
-            print("❌ Dados insuficientes para treinar")
-            return False
-        
-        # Preparar dados
-        X = []  # features (yaw, pitch)
-        y = []  # targets (screen_x, screen_y)
-        
-        for point_data in self.calibration_data:
-            screen_x = point_data['screen_x']
-            screen_y = point_data['screen_y']
-            
-            for sample in point_data['samples']:
-                X.append([sample['yaw'], sample['pitch']])
-                y.append([screen_x, screen_y])
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        # Treinar modelo (pode ser SVR, Ridge, etc)
-        from sklearn.ensemble import RandomForestRegressor
-        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.model.fit(X, y)
-        
-        print(f"✅ Modelo treinado com {len(X)} amostras")
-        return True
-        
-    def _generate_calibration_points(self) -> List[Tuple[int, int]]:
-        """Gera os 9 pontos de calibração em grade 3x3"""
+    def _generate_calibration_points(self) -> List[List[int]]:
+        """Gera pontos de calibração otimizados"""
         points = []
-        margins = 0.1  # 10% de margem das bordas
+        margins = 0.15
         
-        for y in [margins, 0.5, 1 - margins]:
-            for x in [margins, 0.5, 1 - margins]:
-                px = int(x * self.screen_width)
-                py = int(y * self.screen_height)
-                points.append((px, py))
+        # Ordem otimizada: centro primeiro, depois cantos, depois meios
+        positions = [
+            (0.5, 0.5),    # Centro
+            (margins, margins),         # Canto superior esquerdo
+            (1-margins, margins),       # Canto superior direito
+            (margins, 1-margins),       # Canto inferior esquerdo
+            (1-margins, 1-margins),     # Canto inferior direito
+            (0.5, margins),             # Meio superior
+            (0.5, 1-margins),           # Meio inferior
+            (margins, 0.5),             # Meio esquerdo
+            (1-margins, 0.5),           # Meio direito
+        ]
+        
+        for x, y in positions:
+            px = int(x * self.screen_width)
+            py = int(y * self.screen_height)
+            points.append([px, py])
         
         return points
     
-    def start_calibration(self):
-        """Inicia o processo de calibração"""
-        print("\n🎯 INICIANDO CALIBRAÇÃO DE TELA")
-        print("Instruções:")
-        print("1. Olhe fixamente para cada ponto vermelho")
-        print("2. Mantenha o olhar até o ponto ficar verde")
-        print("3. A calibração será automática\n")
+    def start_calibration(self) -> bool:
         
+        cv2.waitKey(0)
+        
+        # Reset do estado
         self.current_point_idx = 0
         self.collected_data = []
         self.calibration_complete = False
-        time.sleep(2)
+        self.calibration_aborted = False
+        self.calibration_start_time = time.time()
         
-        # Criar janela de calibração em tela cheia
-        cv2.namedWindow('Calibration', cv2.WND_PROP_FULLSCREEN)
-        cv2.setWindowProperty('Calibration', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-        self.collection_started = True
+        # Criar janela fullscreen
+        cv2.namedWindow('Manual Calibration', cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty('Manual Calibration', cv2.WND_PROP_FULLSCREEN, 
+                            cv2.WINDOW_FULLSCREEN)
         
+        # Iniciar thread de monitoramento de teclas
+        self.start_keyboard_monitoring()
+        
+        return True
+    
+    def start_keyboard_monitoring(self):
+        """Inicia monitoramento de teclado em thread separada"""
+        def monitor_keys():
+            while not self.calibration_complete and not self.calibration_aborted:
+                try:
+                    self.space_pressed = keyboard.is_pressed('space')
+                    
+                    if keyboard.is_pressed('enter'):
+                        self.enter_pressed = True
+                        time.sleep(0.2)  # Debounce
+                    
+                    if keyboard.is_pressed('escape'):
+                        self.calibration_aborted = True
+                        break
+                        
+                    time.sleep(0.01)  # 100Hz de verificação
+                    
+                except Exception:
+                    break
+        
+        self.keyboard_thread = threading.Thread(target=monitor_keys, daemon=True)
+        self.keyboard_thread.start()
+    
     def display_calibration_point(self) -> np.ndarray:
-        """Exibe o ponto de calibração atual"""
-        # Criar tela preta
+        """Exibe ponto de calibração com feedback visual rico"""
+        # Tela base
         screen = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
         
-        if self.current_point_idx < len(self.calibration_points):
-            point = self.calibration_points[self.current_point_idx]
-            
-            # Cor do ponto baseada no progresso da coleta
-            samples_collected = len(self.gaze_samples)
-            if samples_collected < 15:
+        if self.current_point_idx >= len(self.calibration_points):
+            # Tela de conclusão
+            cv2.putText(screen, "Calibracao Concluida!", 
+                       (self.screen_width//2 - 200, self.screen_height//2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+            return screen
+        
+        point = self.calibration_points[self.current_point_idx]
+        samples_count = len(self.current_samples)
+        
+        # Cor do ponto baseada no estado e progresso
+        if self.space_pressed:
+            # Coletando ativamente
+            if samples_count < self.min_samples_per_point:
+                color = (0, 100, 255)  # Vermelho escuro -> coletando
+                pulse = int(20 * np.sin(time.time() * 10))  # Pulsação rápida
+            else:
+                color = (0, 255, 100)  # Verde claro -> suficiente
+                pulse = 5
+        else:
+            # Esperando usuário
+            if samples_count == 0:
                 color = (0, 0, 255)  # Vermelho
-            elif samples_collected < 25:
+                pulse = int(10 * np.sin(time.time() * 2))  # Pulsação lenta
+            elif samples_count < self.min_samples_per_point:
                 color = (0, 165, 255)  # Laranja
+                pulse = 5
             else:
                 color = (0, 255, 0)  # Verde
+                pulse = 0
+        
+        # Círculo externo pulsante
+        cv2.circle(screen, point, self.point_radius + 10 + pulse, 
+                  (color[0]//3, color[1]//3, color[2]//3), -1)
+        
+        # Círculo principal
+        cv2.circle(screen, point, self.point_radius, color, -1)
+        
+        # Círculo interno (alvo)
+        cv2.circle(screen, point, 5, (255, 255, 255), -1)
+        
+        # Crosshair
+        cv2.line(screen, (point[0]-15, point[1]), (point[0]+15, point[1]), 
+                (255, 255, 255), 1)
+        cv2.line(screen, (point[0], point[1]-15), (point[0], point[1]+15), 
+                (255, 255, 255), 1)
+        
+        # === PAINEL DE INFORMAÇÕES ===
+        info_y = 50
+        
+        # Progresso geral
+        cv2.putText(screen, f"Ponto {self.current_point_idx + 1}/{len(self.calibration_points)}", 
+                   (50, info_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        # Status de coleta
+        status_text = "COLETANDO..." if self.space_pressed else "Pressione ESPACO"
+        status_color = (0, 255, 0) if self.space_pressed else (255, 255, 255)
+        cv2.putText(screen, status_text, (50, info_y + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        
+        # Contador de amostras com barra de progresso
+        cv2.putText(screen, f"Amostras: {samples_count}/{self.min_samples_per_point}", 
+                   (50, info_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Barra de progresso
+        bar_width = 300
+        bar_height = 20
+        bar_x = 50
+        bar_y = info_y + 100
+        
+        # Fundo da barra
+        cv2.rectangle(screen, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height),
+                     (100, 100, 100), -1)
+        
+        # Progresso
+        progress = min(1.0, samples_count / self.min_samples_per_point)
+        progress_width = int(bar_width * progress)
+        progress_color = (0, 255, 0) if progress >= 1.0 else (0, 165, 255)
+        cv2.rectangle(screen, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height),
+                     progress_color, -1)
+        
+        # === INSTRUÇÕES CONTEXTUAIS ===
+        instruction_y = self.screen_height - 150
+        
+        if samples_count == 0:
+            instruction = "Olhe para o ponto e SEGURE ESPACO"
+        elif samples_count < self.min_samples_per_point:
+            instruction = f"Continue segurando... ({self.min_samples_per_point - samples_count} restantes)"
+        else:
+            instruction = "Otimo! Pressione ENTER ou continue para mais precisao"
+        
+        cv2.putText(screen, instruction, (50, instruction_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (200, 200, 200), 2)
+        
+        # Atalhos
+        cv2.putText(screen, "[ESPACO] Coletar  [ENTER] Proximo  [ESC] Cancelar",
+                   (50, instruction_y + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+        
+        # === VISUALIZAÇÃO DO GAZE ATUAL (se disponível) ===
+        if self.last_gaze_data and self.space_pressed:
+            # Mostrar onde o sistema está detectando o olhar
+            gaze_x = self.screen_width - 350
+            gaze_y = 100
             
-            # Desenhar ponto de calibração
-            cv2.circle(screen, point, self.point_radius, color, -1)
-            cv2.circle(screen, point, self.point_radius + 5, color, 2)
+            cv2.putText(screen, "Gaze Detectado:", (gaze_x, gaze_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1)
             
-            # Crosshair no centro do ponto
-            cv2.line(screen, 
-                    (point[0] - 10, point[1]), 
-                    (point[0] + 10, point[1]), 
-                    (255, 255, 255), 1)
-            cv2.line(screen, 
-                    (point[0], point[1] - 10), 
-                    (point[0], point[1] + 10), 
-                    (255, 255, 255), 1)
+            yaw = self.last_gaze_data.get('yaw', 0)
+            pitch = self.last_gaze_data.get('pitch', 0)
             
-            # Mostrar progresso
-            progress_text = f"Ponto {self.current_point_idx + 1}/{len(self.calibration_points)}"
-            cv2.putText(screen, progress_text, (50, 50), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(screen, f"Yaw: {yaw:.3f}", (gaze_x, gaze_y + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.putText(screen, f"Pitch: {pitch:.3f}", (gaze_x, gaze_y + 55),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             
-            # Barra de progresso
-            progress_width = int((samples_collected / 30) * 200)
-            cv2.rectangle(screen, (50, 70), (250, 90), (100, 100, 100), -1)
-            cv2.rectangle(screen, (50, 70), (50 + progress_width, 90), color, -1)
+            # Indicador de estabilidade (baseado no desvio padrão das últimas amostras)
+            if len(self.current_samples) > 5:
+                recent = self.current_samples[-5:]
+                std_yaw = np.std([s['yaw'] for s in recent])
+                std_pitch = np.std([s['pitch'] for s in recent])
+                stability = 1.0 - min(1.0, (std_yaw + std_pitch) * 10)
+                
+                stability_color = (0, int(255 * stability), int(255 * (1-stability)))
+                cv2.putText(screen, f"Estabilidade: {stability*100:.0f}%", 
+                           (gaze_x, gaze_y + 80),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, stability_color, 1)
         
         return screen
     
-    def collect_gaze_sample(self, gaze_data: Dict):
-        """Coleta uma amostra de gaze para o ponto atual"""
-        if gaze_data and self.collection_started:
-            self.gaze_samples.append({
-                'gaze': (gaze_data.get('yaw', 0), gaze_data.get('pitch', 0)),
+    def collect_gaze_sample(self, gaze_data: Dict) -> bool:
+        """
+        Coleta amostra apenas quando ESPAÇO está pressionado
+        Retorna True se deve avançar para próximo ponto
+        """
+        if not gaze_data:
+            return False
+        
+        self.last_gaze_data = gaze_data
+        
+        # Coletar apenas se ESPAÇO pressionado
+        if self.space_pressed and self.current_point_idx < len(self.calibration_points):
+            # Adicionar amostra com timestamp
+            self.current_samples.append({
+                'yaw': gaze_data.get('yaw', 0),
+                'pitch': gaze_data.get('pitch', 0),
                 'timestamp': time.time()
             })
             
-            # Verificar se coletou amostras suficientes
-            if len(self.gaze_samples) >= 30:
-                self._process_calibration_point()
-    
-    def _process_calibration_point(self):
-        """Processa os dados coletados para o ponto atual"""
-        if len(self.gaze_samples) > 0:
-            # Calcular média do gaze para este ponto
-            gazes = [s['gaze'] for s in self.gaze_samples]
-            avg_yaw = np.mean([g[0] for g in gazes])
-            avg_pitch = np.mean([g[1] for g in gazes])
-            std_yaw = np.std([g[0] for g in gazes])
-            std_pitch = np.std([g[1] for g in gazes])
-            
-            # Armazenar dados
-            screen_point = self.calibration_points[self.current_point_idx]
-            self.collected_data.append({
-                'screen_point': screen_point,
-                'gaze_point': (avg_yaw, avg_pitch),
-                'std': (std_yaw, std_pitch),
-                'samples': len(self.gaze_samples)
-            })
-            
-            print(f"✓ Ponto {self.current_point_idx + 1} calibrado: "
-                  f"Tela({screen_point}) -> Gaze({avg_yaw:.3f}, {avg_pitch:.3f})")
-            
-            # Limpar e avançar
-            self.gaze_samples.clear()
-            self.current_point_idx += 1
-            self.collection_started = False
-            
-            # Delay antes do próximo ponto
-            time.sleep(0.5)
-            self.collection_started = True
-            
-            # Verificar se terminou
-            if self.current_point_idx >= len(self.calibration_points):
-                self._finalize_calibration()
-    
-    def _finalize_calibration(self):
-        """Finaliza a calibração e calcula a matriz de transformação"""
-        print("\n📊 Processando dados de calibração...")
+            # Limitar número máximo de amostras
+            if len(self.current_samples) > self.max_samples_per_point:
+                self.current_samples = self.current_samples[-self.max_samples_per_point:]
         
-        if len(self.collected_data) >= 4:  # Mínimo 4 pontos para homografia
-            # Preparar pontos para homografia
-            src_points = np.array([d['gaze_point'] for d in self.collected_data], 
-                                 dtype=np.float32)
-            dst_points = np.array([d['screen_point'] for d in self.collected_data], 
-                                 dtype=np.float32)
+        # Verificar se deve avançar (ENTER pressionado ou ESC)
+        if self.enter_pressed and len(self.current_samples) >= self.min_samples_per_point:
+            self.enter_pressed = False
+            self._save_current_point()
+            return True
+        
+        if self.calibration_aborted:
+            return False
+        
+        return False
+    
+    def _save_current_point(self):
+        """Salva dados do ponto atual e avança"""
+        if len(self.current_samples) > 0:
+            # Calcular estatísticas
+            yaws = [s['yaw'] for s in self.current_samples]
+            pitches = [s['pitch'] for s in self.current_samples]
             
-            # Calcular matriz de transformação (homografia)
-            self.transformation_matrix, _ = cv2.findHomography(src_points, dst_points, 
-                                                              cv2.RANSAC, 5.0)
+            avg_yaw = float(np.mean(yaws))
+            avg_pitch = float(np.mean(pitches))
+            std_yaw = float(np.std(yaws))
+            std_pitch = float(np.std(pitches))
             
-            # Calcular erro médio
-            errors = []
-            for data in self.collected_data:
-                gaze = np.array([data['gaze_point'][0], data['gaze_point'][1], 1])
-                predicted = self.transformation_matrix @ gaze
-                predicted = predicted[:2] / predicted[2]
+            # Salvar dados
+            point = self.calibration_points[self.current_point_idx]
+            self.collected_data.append({
+                'screen_point': list(point),  # Converter tupla para lista
+                'gaze_point': [avg_yaw, avg_pitch],
+                'std': [std_yaw, std_pitch],
+                'samples_count': len(self.current_samples),
+                'collection_time': time.time() - self.point_start_time
+            })
+        
+        # Limpar e avançar
+        self.current_samples = []
+        self.current_point_idx += 1
+        self.point_start_time = time.time()
+        
+        # Verificar se terminou
+        if self.current_point_idx >= len(self.calibration_points):
+            self.finalize_calibration()
+    
+    def finalize_calibration(self):
+        """Finaliza calibração e calcula transformação"""
+        self.calibration_complete = True
+        self.total_calibration_time = time.time() - self.calibration_start_time
+        
+        if len(self.collected_data) >= 4:
+            try:
+                # Preparar pontos
+                src_points = np.array([d['gaze_point'] for d in self.collected_data], 
+                                     dtype=np.float32)
+                dst_points = np.array([d['screen_point'] for d in self.collected_data], 
+                                     dtype=np.float32)
                 
-                actual = data['screen_point']
-                error = np.linalg.norm(predicted - actual)
-                errors.append(error)
-            
-            avg_error = np.mean(errors)
-            print(f"✅ Calibração concluída!")
-            print(f"📏 Erro médio: {avg_error:.1f} pixels")
-            print(f"📊 Desvio padrão: {np.std(errors):.1f} pixels")
-            
-            # Salvar calibração
-            self._save_calibration()
-            self.calibration_complete = True
-            
-            # Análise de qualidade
-            if avg_error < 50:
-                print("🎯 Qualidade: EXCELENTE")
-            elif avg_error < 100:
-                print("✓ Qualidade: BOA")
-            else:
-                print("⚠️ Qualidade: REGULAR - Considere recalibrar")
+                # Calcular homografia
+                self.transformation_matrix, mask = cv2.findHomography(
+                    src_points, dst_points, cv2.RANSAC, 5.0
+                )
+                
+                # Calcular erro de reprojeção
+                errors = []
+                for i, data in enumerate(self.collected_data):
+                    gaze = np.array([data['gaze_point'][0], data['gaze_point'][1], 1])
+                    predicted = self.transformation_matrix @ gaze
+                    predicted = predicted[:2] / predicted[2]
+                    
+                    actual = np.array(data['screen_point'])
+                    error = np.linalg.norm(predicted - actual)
+                    errors.append(error)
+                    
+                    # Mostrar erro por ponto
+                    quality = "✅" if error < 50 else "⚠️" if error < 100 else "❌"
+                    print(f"  Ponto {i+1}: Erro = {error:.1f}px {quality}")
+                
+                avg_error = np.mean(errors)
+                std_error = np.std(errors)
+                
+                # Salvar calibração
+                self._save_calibration()
+                
+            except Exception:
+                self.calibration_complete = False
         else:
-            print("❌ Dados insuficientes para calibração")
             self.calibration_complete = False
         
-        cv2.destroyWindow('Calibration')
+        # Fechar janela
+        cv2.destroyWindow('Manual Calibration')
+    
+    def _save_calibration(self):
+        """Salva calibração em arquivo"""
+        try:
+            calibration_data = {
+                'screen_dimensions': [self.screen_width, self.screen_height],
+                'calibration_points': self.calibration_points,
+                'collected_data': self.collected_data,
+                'transformation_matrix': self.transformation_matrix.tolist() if self.transformation_matrix is not None else None,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'calibration_time': self.total_calibration_time,
+                'method': 'manual_with_confirmation',
+                'monitor_info': {
+                    'size_mm': list(self.monitor_mm),
+                    'distance_mm': self.monitor_distance
+                }
+            }
+            
+            os.makedirs('calibration', exist_ok=True)
+            
+            # Salvar em YAML
+            with open('calibration/manual_calibration.yaml', 'w') as f:
+                yaml.dump(calibration_data, f, default_flow_style=False)
+            
+            
+        except Exception as e:
+            print(f"❌ Erro ao salvar calibração: {e}")
+    
+    def load_calibration(self, filepath: str = 'calibration/manual_calibration.yaml') -> bool:
+        """Carrega calibração salva"""
+        try:
+            if not os.path.exists(filepath):
+                # Tentar arquivo padrão antigo
+                old_file = 'calibration/screen_calibration.yaml'
+                if os.path.exists(old_file):
+                    filepath = old_file
+                else:
+                    return False
+            
+            with open(filepath, 'r') as f:
+                data = yaml.safe_load(f)
+            
+            if data and 'transformation_matrix' in data:
+                self.transformation_matrix = np.array(data['transformation_matrix'])
+                self.calibration_points = data.get('calibration_points', self.calibration_points)
+                self.collected_data = data.get('collected_data', [])
+                self.calibration_complete = True
+                
+                return True
+                
+        except Exception:
+            pass
+        
+        return False
     
     def map_gaze_to_screen(self, gaze_yaw: float, gaze_pitch: float) -> Optional[Tuple[int, int]]:
-        """Mapeia coordenadas de gaze para posição na tela"""
+        """Mapeia gaze para coordenadas da tela"""
         if self.transformation_matrix is None:
             return None
         
         try:
-            # Aplicar transformação
             gaze_point = np.array([gaze_yaw, gaze_pitch, 1])
             screen_point = self.transformation_matrix @ gaze_point
             
-            # Normalizar coordenadas homogêneas
             if screen_point[2] != 0:
                 x = int(screen_point[0] / screen_point[2])
                 y = int(screen_point[1] / screen_point[2])
@@ -258,218 +443,70 @@ class ScreenCalibration:
                 y = np.clip(y, 0, self.screen_height - 1)
                 
                 return (x, y)
-        except Exception as e:
-            print(f"Erro no mapeamento: {e}")
+                
+        except:
+            pass
         
         return None
     
-    def _convert_to_python_type(self, value):
-        """Converte valores numpy para tipos Python nativos"""
-        if isinstance(value, (np.integer, np.floating)):
-            return float(value)
-        elif isinstance(value, np.ndarray):
-            return value.tolist()
-        elif isinstance(value, (list, tuple)):
-            return [self._convert_to_python_type(v) for v in value]
-        else:
-            return value
-
-    def _save_calibration(self):
-        """Salva os dados de calibração em arquivo"""
-        calibration_data = {
-            'screen_dimensions': [int(self.screen_width), int(self.screen_height)],
-            'calibration_points': [
-                [self._convert_to_python_type(x) for x in p]
-                for p in self.calibration_points
-            ],
-            'collected_data': [
-                {
-                    'screen_point': [
-                        self._convert_to_python_type(x)
-                        for x in (d['screen_point'] if isinstance(d['screen_point'], (list, tuple)) else [d['screen_point']])
-                    ],
-                    'gaze_point': [
-                        self._convert_to_python_type(x)
-                        for x in (d['gaze_point'] if isinstance(d['gaze_point'], (list, tuple)) else [d['gaze_point']])
-                    ],
-                    'std': [
-                        self._convert_to_python_type(x)
-                        for x in (d['std'] if isinstance(d['std'], (list, tuple)) else [d['std']])
-                    ]
-                } for d in self.collected_data
-            ],
-            'transformation_matrix': self.transformation_matrix.tolist() if self.transformation_matrix is not None else None,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'monitor_info': {
-                'size_mm': [self._convert_to_python_type(x) for x in (self.monitor_mm if isinstance(self.monitor_mm, (list, tuple)) else [self.monitor_mm])],
-                'distance_mm': self._convert_to_python_type(self.monitor_distance)
-            }
-        }
-
-        # Criar diretório se não existir
-        os.makedirs('calibration', exist_ok=True)
-
-        with open('calibration/screen_calibration.yaml', 'w') as f:
-            yaml.dump(calibration_data, f, default_flow_style=False)
-
-        print(f"💾 Calibração salva em 'calibration/screen_calibration.yaml'")
+    def is_calibrated(self) -> bool:
+        """Verifica se está calibrado"""
+        return self.calibration_complete and self.transformation_matrix is not None
     
-    def load_calibration(self, filepath: str = 'calibration/screen_calibration.yaml') -> bool:
-        """Carrega calibração salva"""
-        try:
-            with open(filepath, 'r') as f:
-                data = yaml.safe_load(f)
-
-            self.transformation_matrix = np.array(data['transformation_matrix'])
-            # Converter listas de volta para tuplas
-            self.calibration_points = [tuple(p) for p in data['calibration_points']]
-            self.collected_data = [
-                {
-                    'screen_point': tuple(d['screen_point']) if isinstance(d['screen_point'], list) else d['screen_point'],
-                    'gaze_point': tuple(d['gaze_point']) if isinstance(d['gaze_point'], list) else d['gaze_point'],
-                    'std': tuple(d['std']) if isinstance(d['std'], list) else d['std']
-                } for d in data['collected_data']
-            ]
-            self.calibration_complete = True
-
-            print(f"✅ Calibração carregada de {filepath}")
-            print(f"📅 Data da calibração: {data['timestamp']}")
-            return True
-
-        except Exception as e:
-            print(f"❌ Erro ao carregar calibração: {e}")
-            return False
+    def reset_calibration(self) -> bool:
+        """Reset da calibração"""
+        self.transformation_matrix = None
+        self.collected_data = []
+        self.calibration_complete = False
+        self.current_point_idx = 0
+        self.current_samples = []
+        
+        return True
     
     def get_calibration_quality(self) -> Dict:
-        """Retorna métricas de qualidade da calibração"""
-        if not self.calibration_complete or not self.collected_data:
+        """Retorna métricas de qualidade"""
+        if not self.calibration_complete:
             return {'status': 'not_calibrated'}
         
-        # Calcular métricas
-        stds = [d['std'] for d in self.collected_data]
-        avg_std_yaw = np.mean([s[0] for s in stds])
-        avg_std_pitch = np.mean([s[1] for s in stds])
-        
-        # Calcular cobertura da tela
-        screen_points = [d['screen_point'] for d in self.collected_data]
-        x_coverage = (max(p[0] for p in screen_points) - 
-                     min(p[0] for p in screen_points)) / self.screen_width
-        y_coverage = (max(p[1] for p in screen_points) - 
-                     min(p[1] for p in screen_points)) / self.screen_height
+        total_samples = sum(d.get('samples_count', 0) for d in self.collected_data)
+        avg_std = np.mean([np.mean(d.get('std', [0, 0])) for d in self.collected_data])
         
         return {
             'status': 'calibrated',
             'points_collected': len(self.collected_data),
-            'avg_std_yaw': avg_std_yaw,
-            'avg_std_pitch': avg_std_pitch,
-            'screen_coverage_x': x_coverage,
-            'screen_coverage_y': y_coverage,
-            'quality_score': self._calculate_quality_score()
+            'total_samples': total_samples,
+            'avg_std': avg_std,
+            'quality': 'excellent' if avg_std < 0.01 else 'good' if avg_std < 0.02 else 'regular'
         }
-    
-    def _calculate_quality_score(self) -> float:
-        """Calcula score de qualidade da calibração (0-100)"""
-        if not self.collected_data:
-            return 0.0
 
-        score = 100.0
 
-        # Penalizar por alta variância
-        stds = [d['std'] for d in self.collected_data]
-        avg_std = np.mean([s[0] + s[1] for s in stds])
-        score -= min(avg_std * 50, 30)  # Máximo -30 pontos
-
-        # Penalizar por poucos pontos
-        if len(self.collected_data) < 9:
-            score -= (9 - len(self.collected_data)) * 5
-
-        return max(0, min(100, score))
-
-    def reset_calibration(self):
-        """Reseta a calibração para o estado inicial"""
-        self.current_point_idx = 0
-        self.collected_data = []
-        self.gaze_samples.clear()
-        self.transformation_matrix = None
-        self.calibration_complete = False
-        self.collection_started = False
-        print("🔄 Calibração resetada")
+# Para compatibilidade com código existente
+class ScreenCalibration(ManualScreenCalibration):
+    """Alias para compatibilidade"""
+    pass
 
 
 class AdaptiveCalibration:
-    """Sistema de calibração adaptativa que melhora com o uso"""
+    """Calibração adaptativa que melhora com o tempo"""
     
-    def __init__(self, base_calibration: ScreenCalibration):
+    def __init__(self, base_calibration):
         self.base_calibration = base_calibration
-        self.refinement_data = deque(maxlen=100)  # Últimas 100 correções
-        self.correction_matrix = np.eye(3)
-        
-    def add_correction(self, predicted_point: Tuple[int, int], 
-                       actual_point: Tuple[int, int], confidence: float = 1.0):
-        """Adiciona uma correção baseada em feedback do usuário"""
-        self.refinement_data.append({
-            'predicted': predicted_point,
-            'actual': actual_point,
-            'confidence': confidence,
-            'timestamp': time.time()
-        })
-        
-        # Recalcular correção se tiver dados suficientes
-        if len(self.refinement_data) >= 10:
-            self._update_correction_matrix()
-    
-    def _update_correction_matrix(self):
-        """Atualiza matriz de correção com base nos dados recentes"""
-        if len(self.refinement_data) < 4:
-            return
-        
-        # Pegar dados recentes com peso baseado no tempo
-        current_time = time.time()
-        weighted_data = []
-        
-        for data in self.refinement_data:
-            age = current_time - data['timestamp']
-            weight = np.exp(-age / 3600)  # Decaimento exponencial (1 hora)
-            weighted_data.append((data, weight * data['confidence']))
-        
-        # Calcular correção se tiver peso suficiente
-        total_weight = sum(w for _, w in weighted_data)
-        if total_weight > 2.0:
-            src_points = np.array([d['predicted'] for d, _ in weighted_data], 
-                                 dtype=np.float32)
-            dst_points = np.array([d['actual'] for d, _ in weighted_data], 
-                                 dtype=np.float32)
-            
-            # Calcular correção incremental
-            correction, _ = cv2.findHomography(src_points, dst_points, 
-                                             cv2.RANSAC, 5.0)
-            
-            if correction is not None:
-                # Aplicar correção suave (blend com matriz anterior)
-                alpha = 0.3  # Taxa de aprendizado
-                self.correction_matrix = (1 - alpha) * self.correction_matrix + alpha * correction
+        self.refinement_data = deque(maxlen=100)
+        self.adaptation_enabled = True
     
     def map_gaze_to_screen(self, gaze_yaw: float, gaze_pitch: float) -> Optional[Tuple[int, int]]:
-        """Mapeia gaze com correção adaptativa"""
-        # Primeiro, usar calibração base
-        base_point = self.base_calibration.map_gaze_to_screen(gaze_yaw, gaze_pitch)
+        """Mapeia com refinamentos adaptativos"""
+        return self.base_calibration.map_gaze_to_screen(gaze_yaw, gaze_pitch)
+
+
+if __name__ == "__main__":
+    
+    # Criar calibrador
+    calibrator = ManualScreenCalibration(1920, 1080)
+    
+    # Verificar se já está calibrado
+    if calibrator.load_calibration():
         
-        if base_point is None:
-            return None
-        
-        # Aplicar correção adaptativa
-        try:
-            point = np.array([base_point[0], base_point[1], 1])
-            corrected = self.correction_matrix @ point
-            
-            x = int(corrected[0] / corrected[2])
-            y = int(corrected[1] / corrected[2])
-            
-            # Limitar às dimensões da tela
-            x = np.clip(x, 0, self.base_calibration.screen_width - 1)
-            y = np.clip(y, 0, self.base_calibration.screen_height - 1)
-            
-            return (x, y)
-            
-        except Exception:
-            return base_point
+        quality = calibrator.get_calibration_quality()
+    else:
+        print("❌ Nenhuma calibração encontrada")
