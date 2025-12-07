@@ -22,7 +22,6 @@ class PerformanceOptimizer:
         self.frame_time_budget = 1.0 / self.target_fps
         self.processing_times = deque(maxlen=30)
         
-        print("⚡ Otimizador de Performance inicializado")
     
     def should_detect_face(self) -> bool:
         """Determina se deve executar detecção facial custosa"""
@@ -210,7 +209,7 @@ class AdaptiveProcessor:
                 self.current_quality = 'low'
             
             self.last_adjustment = time.time()
-            print(f"⬇️ Qualidade reduzida para {self.current_quality}")
+            print(f"Qualidade reduzida para {self.current_quality}")
             
         elif avg_time < target_time * 0.7 and self.current_quality != 'high':
             # Performance boa, aumenta qualidade
@@ -220,7 +219,7 @@ class AdaptiveProcessor:
                 self.current_quality = 'high'
             
             self.last_adjustment = time.time()
-            print(f"⬆️ Qualidade aumentada para {self.current_quality}")
+            print(f"Qualidade aumentada para {self.current_quality}")
     
     def get_current_settings(self) -> Dict:
         """Retorna configurações atuais baseadas na qualidade"""
