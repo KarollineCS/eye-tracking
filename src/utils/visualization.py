@@ -35,7 +35,6 @@ class VisualizationManager:
         self.LEFT_EYE_POINTS = list(range(36, 42))
         self.RIGHT_EYE_POINTS = list(range(42, 48))
         
-        print("🎨 Gerenciador de Visualização inicializado")
     
     def render_frame(self, frame, results, is_calibrating, calibration_system, 
                     screen_calibration, current_fps):
@@ -114,41 +113,132 @@ class VisualizationManager:
     
     def draw_iris_detection(self, frame, iris_data):
         """Desenha detecção de íris"""
+        if not iris_data:
+            return
+
         for eye_side, data in iris_data.items():
-            center = data['center']
-            radius = data['radius']
-            
-            color = self.colors['iris_left'] if eye_side == 'left' else self.colors['iris_right']
-            
-            # Círculo da íris
-            cv2.circle(frame, tuple(map(int, center)), int(radius), color, 2)
-            
-            # Centro da íris
-            cv2.circle(frame, tuple(map(int, center)), 3, color, -1)
+            if not isinstance(data, dict):
+                continue
+
+            # Verificar se temos dados necessários
+            center = data.get('center')
+            radius = data.get('radius')
+
+            if center is None or radius is None:
+                continue
+
+            try:
+                color = self.colors['iris_left'] if eye_side == 'left' else self.colors['iris_right']
+
+                # Círculo da íris
+                cv2.circle(frame, tuple(map(int, center)), int(radius), color, 2)
+
+                # Centro da íris
+                cv2.circle(frame, tuple(map(int, center)), 3, color, -1)
+            except (ValueError, TypeError):
+                continue  # Ignorar se conversão falhar
     
     def draw_gaze_vectors(self, frame, gaze_vectors):
         """Desenha vetores de gaze"""
+        if not gaze_vectors:
+            return
+
         for eye_side, data in gaze_vectors.items():
-            eye_center = data['eye_center']
-            iris_center = data['iris_center']
-            
+            # Verificar se temos dados mínimos necessários
+            if not isinstance(data, dict):
+                continue
+
+            # Pegar iris_center (obrigatório)
+            iris_center = data.get('iris_center')
+            if iris_center is None:
+                continue
+
             color = self.colors['left_eye'] if eye_side == 'left' else self.colors['right_eye']
-            
-            # Linha do centro do olho para íris
-            cv2.line(frame, tuple(map(int, eye_center)), 
-                    tuple(map(int, iris_center)), color, 2)
-            
-            # Vetor de direção do olhar
-            scale = 50
-            vector_3d = data['vector_3d']
-            end_point = (
-                iris_center[0] + int(vector_3d[0] * scale),
-                iris_center[1] + int(vector_3d[1] * scale)
-            )
-            
-            cv2.arrowedLine(frame, tuple(map(int, iris_center)), 
-                           tuple(map(int, end_point)), self.colors['gaze_vector'], 2)
+
+            # Desenhar linha do centro do olho para íris (se disponível)
+            eye_center = data.get('eye_center')
+            if eye_center is not None:
+                try:
+                    cv2.line(frame, tuple(map(int, eye_center)),
+                            tuple(map(int, iris_center)), color, 2)
+                except (ValueError, TypeError):
+                    pass  # Ignorar se conversão falhar
+
+            # Vetor de direção do olhar (se disponível)
+            vector_3d = data.get('vector_3d')
+            if vector_3d is not None:
+                try:
+                    scale = 50
+                    end_point = (
+                        iris_center[0] + int(vector_3d[0] * scale),
+                        iris_center[1] + int(vector_3d[1] * scale)
+                    )
+
+                    cv2.arrowedLine(frame, tuple(map(int, iris_center)),
+                                   tuple(map(int, end_point)), self.colors['gaze_vector'], 2)
+                except (ValueError, TypeError, IndexError):
+                    pass  # Ignorar se conversão falhar
     
+    def draw_gaze_3d_target(self, frame, screen_point_3d, label="3D Gaze", screen_resolution=None):
+        """
+        Desenha o ponto alvo calculado pelo sistema 3D
+
+        Args:
+            frame: Frame onde desenhar
+            screen_point_3d: Tupla (x, y) em coordenadas da tela
+            label: Label para o ponto
+            screen_resolution: Tupla (width, height) da resolução da tela. Se None, usa frame shape
+        """
+        if screen_point_3d is None:
+            return
+
+        try:
+            x, y = screen_point_3d
+
+            # Converter coordenadas da tela para coordenadas do frame
+            h, w = frame.shape[:2]
+
+            # Se screen_resolution for fornecida, usar para escalar corretamente
+            if screen_resolution:
+                screen_w, screen_h = screen_resolution
+                frame_x = int(x * w / screen_w)
+                frame_y = int(y * h / screen_h)
+            else:
+                # Assumir que as coordenadas já estão na escala do frame
+                frame_x = int(x)
+                frame_y = int(y)
+
+            # Cor: ciano brilhante para destacar
+            color = (255, 255, 0)  # Ciano
+
+            # Círculo principal (ponto de gaze)
+            cv2.circle(frame, (frame_x, frame_y), 15, color, 2)
+            cv2.circle(frame, (frame_x, frame_y), 3, color, -1)
+
+            # Crosshair
+            length = 25
+            cv2.line(frame, (frame_x - length, frame_y), (frame_x + length, frame_y), color, 2)
+            cv2.line(frame, (frame_x, frame_y - length), (frame_x, frame_y + length), color, 2)
+
+            # Label com coordenadas
+            text = f"{label}: ({x}, {y})"
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            text_x = frame_x + 20
+            text_y = frame_y - 10
+
+            # Fundo para o texto
+            cv2.rectangle(frame,
+                         (text_x - 2, text_y - text_size[1] - 2),
+                         (text_x + text_size[0] + 2, text_y + 2),
+                         (0, 0, 0), -1)
+
+            # Texto
+            cv2.putText(frame, text, (text_x, text_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        except (ValueError, TypeError, IndexError):
+            pass  # Ignorar erros de conversão
+
     def draw_gaze_prediction(self, frame, screen_point):
         """Desenha predição do ponto de olhar"""
         frame_x = int(screen_point[0] * frame.shape[1] / 1920)  # Ajusta para resolução do frame
@@ -250,13 +340,6 @@ class VisualizationManager:
         screen_w, screen_h = self._screen_resolution
         frame_x = int(point[0] * frame_w / screen_w)
         frame_y = int(point[1] * frame_h / screen_h)
-
-        #print(f"🔧 DEBUG: Ponto original: {point}")
-        #print(f"🔧 DEBUG: Frame shape: {frame_w}x{frame_h}")
-        #print(f"🔧 DEBUG: Config resolution: {self.config.hardware.resolution}")
-
-        #print(f"🔧 DEBUG: Ponto convertido: ({frame_x}, {frame_y})")
-        #print("=" * 50)
         
         # Interface para contagem regressiva
         if current_point.get('is_in_countdown', False):
