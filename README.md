@@ -96,6 +96,7 @@ python main.py
 **Calibração:**
 | Tecla | Função |
 |-------|--------|
+| `p` | Calibração do plano do monitor |
 | `e` | Calibrar esferas oculares |
 | `o` | Calibrar offset de 1 ponto (sistema 3D) |
 | `h` | Calibração de 9 pontos |
